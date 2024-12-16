@@ -1,0 +1,223 @@
+---
+title: "K5 Topography export data"
+subtitle: "Reading and visualizing topography data from the OCULUS Keratograph"
+author: "Florian Faulstich"
+layout: wide
+format: 
+  html:
+    code-fold: true
+    theme: 
+      dark: darkly
+      light: default
+    toc: true
+    toc-depth: 3
+    toc-location: left
+execute: 
+  freeze: auto
+  cache: true
+---
+
+```{r setup, include=FALSE}
+library(OcuRUtils)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(plotly)
+```
+
+# Introduction
+
+The OCULUS Keratograph allows to export topography data, which can then be used for further analysis. A typical use case would be to use the exported topographical data to simulate contact lenses on the eye, as it is already done by some contact lens manufacturers.
+
+This document aims to give an example how the exported topography data can be used.\
+Major goal is to simplify the process of implementing an interface to read the data and avoid potential pitfalls.
+
+# Exported data
+
+::: callout-note
+The export of the Keratograph can be modified in the settings of the OCULUS software.
+
+These settings can impact, which files are generated and where the output directory is.
+
+Since that's not the scope of this document, we'll assume, that the files have already been generated and focus on explaining the structure of the topographical data specifically.
+:::
+
+The primary files of interest should be located in your export directory after triggering the export:
+
+```{r}
+#| echo: false
+list.files("K5_export/Demo_Normal/") |>
+  grep(pattern = r"(CORNEA)", value = T) |>
+  paste(collapse = "\n") |>
+  cat()
+```
+
+These files contain the topographical data of the cornea, where the extension indicates the side (OD = right eye, OS = left eye).\
+The suffix '\_F' indicates, that the data in this file includes extrapolated data.\
+Hence, the file without the '\_F' suffix contains only measured data, without extrapolation.
+
+# Format
+
+The files are plain text files → readable in any text editor.\
+The format used is [**not**]{.underline} a standard format.
+
+Here's the first few lines:
+
+```{r}
+readLines("K5_export/Demo_Normal/CORNEA.OS", n = 13) |>
+  cat(sep = "\n")
+```
+
+Each line follows a consistent pattern of three key-value pairs forming a table with three columns:
+
+::: callout-tip
+## Pattern
+
+Seg: \<seg-value\> y= \<y-value\> x= \<x-value\>
+:::
+
+The Values from each column correspond to a point on the surface described in cylindrical coordinates, where:
+
+1.  **Seg** corresponds to the segment number (index, starting with zero)\
+    → polar angle
+2.  **y** corresponds to the 'distance from center'\
+    → polar distance (in the x-y-plane)
+3.  **x** corresponds to the saggital depth at the given position\
+    → z-value
+
+# Data processing
+
+In the following, we're going to use the 'CORNEA.OS' file as an example to show, how we can extract the topographical data.
+
+```{r}
+tbl_topo <- tibble(raw = readLines("K5_export/Demo_Normal/CORNEA.OS"))
+```
+
+To convert this data to cartesian coordinates, we first need to parse the values from the text file:
+
+```{r}
+ptn <- r"(Seg:\s*(\d+)\s*y=\s*(\S+)\s*x=\s*(\S+))"
+tbl_topo <- tbl_topo |>
+  rowwise() |>
+  transmute(
+    seg = raw |> str_match(ptn) |> c() |> nth(2) |> as.numeric(), # seg: ...
+    l = raw |> str_match(ptn) |> c() |> nth(3) |> as.numeric(),   # y= ...
+    z = raw |> str_match(ptn) |> c() |> nth(4) |> as.numeric()    # x= ...
+  ) |> ungroup()
+tbl_topo
+```
+
+::: callout-important
+Please note, that we're renaming the x- and y- values, to avoid confusion , because they don't correspond to actual cartesian x- and y- coordinates.
+:::
+
+To convert the segment value into the polar angle we need to calculate the corresponding angle. Since the meridians are evenly distributed the formula for the corresponding angle is:
+
+$$
+\alpha_{seg} = \frac{seg}{max(seg)+1}*2*\pi
+$$
+
+```{r}
+tbl_topo <- tbl_topo |>
+  mutate(
+    ang = seg / (max(seg) + 1) * 2 * pi
+  ) |> select(-seg)
+```
+
+Based off these now complete cylindric coordinates, we can calculate cartesian coordinates:
+
+```{r}
+tbl_topo <- tbl_topo |>
+  mutate(
+    x = l * cos(ang),
+    y = l * sin(ang)
+  )
+tbl_topo |>
+  plot()
+```
+
+# Chirality
+
+The data we've processed now looks as follows, when we display it in 3D:
+
+::: {#3DGraph}
+```{r}
+tbl_topo |>
+  plot_ly(
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 2)
+  ) |>
+  dark_ly(aspectMode = "data")
+```
+:::
+
+If you pay close attention, you might notice, that the topography is flipped.
+
+Knowing that we've loaded the data from a left eye, and using characteristical features of the outline of the topography -- like the shadow of the nose, and the shadow of the forehead -- we can infer, that the topography is flipped.
+
+![shadow of nose and forehead](images/clipboard-250603149.png)
+
+::: callout-note
+This effect can be missed easily and is best to be observed in 3D.
+
+You can go back to the [3D Graph](#3DGraph) and rotate the graph to see the effect.
+:::
+
+::: callout-caution
+## potential pitfall
+
+The sagittal depth values stored in the file are absolute values → not signed.\
+If we just parse them from the file, we might end up with a flipped image.
+
+This is, because the common convention is to arrange cartesian coordinates in a right-handed coordinate system, where the z-axis points towards the observer.\
+This would result in the topography warping in the direction of the observer, hence the observer would be on the concave side.
+:::
+
+In general, these kind of effects where an object is mirrored, are often referred to as [chirality](https://en.wikipedia.org/wiki/Chirality)-error.
+
+Effectively that makes the left eye look like a right eye (and vice versa).
+
+::: callout-tip
+## solution
+
+The most straight forward fix for this is to invert the z-values:
+
+$$
+z = -z
+$$
+
+```{r}
+tbl_topo <- tbl_topo |>
+  mutate(
+    z = -z
+  )
+```
+
+That way the data can be displayed without the mirroring effect.
+:::
+
+```{r}
+tbl_topo |>
+  plot_ly(
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 2)
+  ) |>
+  dark_ly(aspectMode = "data")
+```
+
+# Conclusion
+
+If you followed the steps in this document, you might have noticed that most of the process is pretty straight forward.\
+... maybe with the exception of the chirality issue.
+
+It is definitely worth to keep this in mind, when working with topographical data, and have strategies on mind, that allow you to check, if your loading process introduces a chirality error.
+
+Also be aware, that the issue arises, when you're assuming a different convention/reference system, than the one that was used to generate the data.
